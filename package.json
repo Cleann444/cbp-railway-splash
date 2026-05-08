@@ -1,0 +1,14 @@
+{
+  "name": "cbp-railway-splash",
+  "version": "1.0.0",
+  "description": "Node.js proxy backend for trynProxy with Splash integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "lru-cache": "^10.2.2",
+    "node-fetch": "^2.7.0"
+  }
+}
