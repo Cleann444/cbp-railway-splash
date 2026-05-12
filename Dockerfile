@@ -21,4 +21,7 @@ ENV PORT=8080
 
 EXPOSE 8080
 
+RUN chown -R splash /proxy
+USER splash
+
 CMD ["./start.sh"]
