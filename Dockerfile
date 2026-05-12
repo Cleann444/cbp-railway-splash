@@ -18,6 +18,7 @@ RUN chmod +x start.sh
 # Environment variables
 ENV SPLASH_URL=http://localhost:8050
 ENV PORT=8080
+ENV QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox"
 
 EXPOSE 8080
 
