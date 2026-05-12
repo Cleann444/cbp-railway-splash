@@ -22,7 +22,6 @@ ENV QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox"
 
 EXPOSE 8080
 
-RUN chown -R splash /proxy
-USER splash
+RUN mkdir -p /etc/splash/filters /etc/splash/proxy-profiles /etc/splash/js-profiles /etc/splash/lua_modules
 
 CMD ["./start.sh"]
