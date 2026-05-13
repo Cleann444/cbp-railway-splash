@@ -134,6 +134,11 @@ app.post('/api/proxy', async (req, res) => {
     response.headers.forEach((v, k) => { responseHeaders[k] = v; });
     responseHeaders['content-type'] = contentType;
 
+    // Strip frame-busting headers so content renders in the proxy iframe
+    delete responseHeaders['x-frame-options'];
+    delete responseHeaders['content-security-policy'];
+    delete responseHeaders['content-security-policy-report-only'];
+
     const responseObj = {
       status: response.status,
       headers: responseHeaders,
