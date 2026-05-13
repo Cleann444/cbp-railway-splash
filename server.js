@@ -4,65 +4,47 @@ const { LRUCache } = require('lru-cache');
 const fetch = require('node-fetch');
 
 const PORT = process.env.PORT || 8080;
-const SECRET = process.env.SECRET;
 const SPLASH_URL = process.env.SPLASH_URL || 'http://localhost:8050';
 
-if (!SECRET) {
-  console.error('FATAL: SECRET environment variable is not set.');
-  process.exit(1);
-}
-
 const app = express();
-
-// Use a raw body parser for the binary data
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
-// LRU Cache: 5 minutes TTL, max 500 items
-const cache = new LRUCache({
-  max: 500,
-  ttl: 1000 * 60 * 5,
-});
+const cache = new LRUCache({ max: 500, ttl: 1000 * 60 * 5 });
 
-// --- Encryption logic matching SubtleCrypto AES-GCM ---
-function getEpoch() {
-  return Math.floor(Date.now() / 600000);
+// ── ECDH key pair (auto-generated on startup, no secrets needed) ─────────────
+const serverECDH = crypto.createECDH('prime256v1');
+serverECDH.generateKeys();
+const serverPubKeyB64 = serverECDH.getPublicKey('base64');
+console.log('ECDH key pair generated automatically.');
+
+function deriveAESKey(clientPubBuf) {
+  const shared = serverECDH.computeSecret(clientPubBuf);
+  return crypto.createHash('sha256').update(shared).digest();
 }
 
-function getKey(epoch) {
-  return crypto.createHash('sha256').update(`${SECRET}:${epoch}`).digest();
+// Request body: [65 bytes client pubkey] [12 bytes IV] [ciphertext] [16 bytes tag]
+function decryptRequest(body) {
+  if (body.length < 93) throw new Error('Payload too small');
+  const clientPub = body.subarray(0, 65);
+  const iv = body.subarray(65, 77);
+  const tag = body.subarray(body.length - 16);
+  const ct = body.subarray(77, body.length - 16);
+  const key = deriveAESKey(clientPub);
+  const dec = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  dec.setAuthTag(tag);
+  const plain = Buffer.concat([dec.update(ct), dec.final()]);
+  return { data: JSON.parse(plain.toString()), aesKey: key };
 }
 
-function decryptObject(buffer, epoch) {
-  if (buffer.length < 28) throw new Error('Buffer too small to contain IV, Ciphertext, and AuthTag');
-  
-  const iv = buffer.subarray(0, 12);
-  const authTag = buffer.subarray(buffer.length - 16);
-  const ciphertext = buffer.subarray(12, buffer.length - 16);
-  
-  const key = getKey(epoch);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(authTag);
-  
-  let decrypted = decipher.update(ciphertext);
-  decrypted = Buffer.concat([decrypted, decipher.final()]);
-  return JSON.parse(decrypted.toString('utf8'));
-}
-
-function encryptObject(obj, epoch) {
+// Response body: [12 bytes IV] [ciphertext] [16 bytes tag]
+function encryptResponse(obj, aesKey) {
   const plain = JSON.stringify(obj);
-  const key = getKey(epoch);
   const iv = crypto.randomBytes(12);
-  
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  let encrypted = cipher.update(plain, 'utf8');
-  encrypted = Buffer.concat([encrypted, cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  
-  // SubtleCrypto appends authTag to ciphertext
-  return Buffer.concat([iv, encrypted, authTag]);
+  const enc = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
+  const ct = Buffer.concat([enc.update(plain, 'utf8'), enc.final()]);
+  return Buffer.concat([iv, ct, enc.getAuthTag()]);
 }
 
-// --- Splash detection ---
 function needsSplash(htmlStr, contentLength) {
   if (contentLength < 500) return true;
   if (htmlStr.includes('<div id="root"')) return true;
@@ -71,139 +53,104 @@ function needsSplash(htmlStr, contentLength) {
   return false;
 }
 
-// --- CORS ---
+// ── CORS ─────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   res.header('Access-Control-Max-Age', '86400');
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
 
-// --- Health Check ---
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+app.get('/health', (req, res) => res.status(200).send('OK'));
+
+// ── Public key endpoint (frontend fetches this once on load) ─────────────────
+app.get('/api/pubkey', (req, res) => {
+  res.json({ publicKey: serverPubKeyB64 });
 });
 
-// --- Proxy Endpoint ---
+// ── Proxy endpoint ───────────────────────────────────────────────────────────
 app.post('/api/proxy', async (req, res) => {
   try {
-    const epoch = getEpoch();
-    let requestObj;
+    let requestObj, aesKey;
     try {
-      requestObj = decryptObject(req.body, epoch);
+      const result = decryptRequest(req.body);
+      requestObj = result.data;
+      aesKey = result.aesKey;
     } catch (err) {
       console.error('Decryption error:', err.message);
       return res.status(400).send(`Decryption error: ${err.message}`);
     }
 
     const { method = 'GET', target, headers = {}, bodyBase64 } = requestObj;
+    if (!target) return res.status(400).send('Target URL missing');
 
-    if (!target) {
-      return res.status(400).send('Target URL missing');
-    }
-
-    // Check cache
     const cacheKey = `${method}:${target}`;
     if (method === 'GET' && cache.has(cacheKey)) {
-      const cachedResponse = cache.get(cacheKey);
-      const encryptedResponse = encryptObject(cachedResponse, epoch);
+      const cached = cache.get(cacheKey);
       res.setHeader('Content-Type', 'application/octet-stream');
-      return res.status(200).send(encryptedResponse);
+      return res.status(200).send(encryptResponse(cached, aesKey));
     }
 
-    // Prepare forward fetch
-    const fetchOptions = {
-      method,
-      headers: { ...headers },
-      redirect: 'follow',
-    };
-    
-    // Strip forbidden headers
-    delete fetchOptions.headers['host'];
-    delete fetchOptions.headers['origin'];
-    delete fetchOptions.headers['referer'];
-
+    const fetchOpts = { method, headers: { ...headers }, redirect: 'follow' };
+    delete fetchOpts.headers['host'];
+    delete fetchOpts.headers['origin'];
+    delete fetchOpts.headers['referer'];
     if (bodyBase64 && ['POST', 'PUT', 'PATCH'].includes(method)) {
-      fetchOptions.body = Buffer.from(bodyBase64, 'base64');
+      fetchOpts.body = Buffer.from(bodyBase64, 'base64');
     }
 
-    let response;
-    let responseBodyBuffer;
-    let finalUrl;
-    let contentType;
-
+    let response, responseBodyBuffer, finalUrl, contentType;
     try {
-      response = await fetch(target, fetchOptions);
+      response = await fetch(target, fetchOpts);
       responseBodyBuffer = await response.buffer();
       finalUrl = response.url || target;
       contentType = response.headers.get('content-type') || 'application/octet-stream';
     } catch (err) {
-      console.error('Initial fetch failed:', err.message);
+      console.error('Fetch failed:', err.message);
       return res.status(502).send(`Fetch failed: ${err.message}`);
     }
 
-    const isHtml = contentType.includes('text/html');
-    let useSplash = false;
-
-    if (isHtml && method === 'GET') {
+    if (contentType.includes('text/html') && method === 'GET') {
       const htmlStr = responseBodyBuffer.toString('utf8');
       if (needsSplash(htmlStr, responseBodyBuffer.length)) {
-        useSplash = true;
-      }
-    }
-
-    if (useSplash) {
-      console.log(`[Splash] Falling back to Splash for ${target}`);
-      const splashEndpoint = `${SPLASH_URL}/render.html?url=${encodeURIComponent(target)}&wait=0.5`;
-      try {
-        const splashRes = await fetch(splashEndpoint);
-        if (splashRes.ok) {
-          const splashHtml = await splashRes.buffer();
-          responseBodyBuffer = splashHtml;
-          contentType = 'text/html';
-          // Splash might not give us the final URL of redirects as easily, but usually it's fine
-        } else {
-          console.error(`Splash error ${splashRes.status}`);
+        console.log(`[Splash] ${target}`);
+        try {
+          const splashRes = await fetch(
+            `${SPLASH_URL}/render.html?url=${encodeURIComponent(target)}&wait=0.5`
+          );
+          if (splashRes.ok) {
+            responseBodyBuffer = await splashRes.buffer();
+            contentType = 'text/html';
+          }
+        } catch (err) {
+          console.error('Splash failed:', err.message);
         }
-      } catch (err) {
-        console.error('Splash fetch failed:', err.message);
-        // We will just fall back to the initial raw HTML if splash fails
       }
     }
 
     const responseHeaders = {};
-    if (response) {
-      response.headers.forEach((value, key) => {
-        responseHeaders[key] = value;
-      });
-    }
-    responseHeaders['content-type'] = contentType; // Override with possible Splash type
+    response.headers.forEach((v, k) => { responseHeaders[k] = v; });
+    responseHeaders['content-type'] = contentType;
 
     const responseObj = {
-      status: response ? response.status : 200,
+      status: response.status,
       headers: responseHeaders,
       bodyBase64: responseBodyBuffer.toString('base64'),
-      finalUrl: finalUrl
+      finalUrl,
     };
 
-    if (method === 'GET' && responseObj.status === 200) {
-      cache.set(cacheKey, responseObj);
-    }
+    if (method === 'GET' && responseObj.status === 200) cache.set(cacheKey, responseObj);
 
-    const encryptedResponse = encryptObject(responseObj, epoch);
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.status(200).send(encryptedResponse);
-
+    res.status(200).send(encryptResponse(responseObj, aesKey));
   } catch (err) {
-    console.error('Proxy internal error:', err);
+    console.error('Proxy error:', err);
     res.status(500).send(`Proxy error: ${err.message}`);
   }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`CBP-Railway-Splash Proxy listening on port ${PORT}`);
+  console.log(`CBP-Railway-Splash listening on port ${PORT}`);
 });
